@@ -511,8 +511,10 @@ type
     FTagList: TecTokenList;
     FCurState: integer;
     FStateChanges: TecStateChanges;
+    FBufferList: TFPList; //Alexey
     FLastAnalPos: integer;
     FOnAddRangeSimple: TecOnAddRangeSimple; //Alexey
+    FCriSecForBuffers: TCriticalSection; //Alexey
 
     function GetLastPos: integer;
     function ExtractTag(var FPos: integer; ADisableFolding: Boolean): Boolean;
@@ -550,8 +552,10 @@ type
     TokenIndexer: array of integer; //Alexey
     //holds booleans: first token of i-th line is a 'comment'
     CmtIndexer: packed array of boolean; //Alexey
+    //buffers which are no longer needed by parser, but parser cannot free them immediately
+    OldBufferList: TFPList;
 
-    constructor Create(AOwner: TecSyntAnalyzer; ABuffer: TATStringBuffer; const AClient: IecSyntClient);
+    constructor Create(AOwner: TecSyntAnalyzer; AClient: IecSyntClient);
     destructor Destroy; override;
 
     procedure Clear; virtual;
@@ -559,7 +563,11 @@ type
     function ParserStateAtPos(ATokenIndex: integer): integer;
 
     property Owner: TecSyntAnalyzer read FOwner;
-    property Buffer: TATStringBuffer read FBuffer;
+    property Buffer: TATStringBuffer read FBuffer write FBuffer;
+    procedure AddBuffer(ABuffer: TATStringBuffer);
+    function GetBuffer: TATStringBuffer;
+    procedure ClearOldBuffers;
+
     property IsFinished: Boolean read FFinished;
     function TokenIndent(Token: PecSyntToken): integer; // Alexey
     function TagsSame(Index1, Index2: integer): boolean; // Alexey
@@ -684,7 +692,7 @@ type
     EventParseStop: TEvent;
     CriSecForData: TCriticalSection;
 
-    constructor Create(AOwner: TecSyntAnalyzer; ABuffer: TATStringBuffer);
+    constructor Create(AOwner: TecSyntAnalyzer);
     destructor Destroy; override;
     procedure Clear; override;
     function PriorTokenAt(Pos: integer): integer;
@@ -1108,6 +1116,7 @@ begin
       {$endif}
 
       //this repeat/until is needed to avoid having broken PublicData, when eprInterrupted occurs
+      An.Buffer := An.GetBuffer;
       SavedChangePos := An.FPrevChangePos;
       repeat
         Res := An.ParseInThread;
@@ -2212,15 +2221,11 @@ end;
 
 { TecParserResults }
 
-constructor TecParserResults.Create(AOwner: TecSyntAnalyzer;
-  ABuffer: TATStringBuffer; const AClient: IecSyntClient);
+constructor TecParserResults.Create(AOwner: TecSyntAnalyzer; AClient: IecSyntClient);
 //TODO: del AUseTimer
 begin
   inherited Create;
-  if ABuffer = nil then
-    raise Exception.Create('TextBuffer not passed to parser');
   FOwner := AOwner;
-  FBuffer := ABuffer;
   FClient := AClient;
   FTagList := TecTokenList.Create(False);
   FSubLexerBlocks := TecSubLexerRanges.Create;
@@ -2228,11 +2233,26 @@ begin
   FCurState := 0;
   FStateChanges := TecStateChanges.Create;
   FPrevChangePos := -1;
+  FCriSecForBuffers := TCriticalSection.Create;
+  FBufferList := TFPList.Create;
+  OldBufferList := TFPList.Create;
 end;
 
 destructor TecParserResults.Destroy;
+var
+  i: integer;
 begin
   FOwner.FClientList.Remove(Self);
+
+  for i := FBufferList.Count-1 downto 0 do
+    TObject(FBufferList[i]).Free;
+  FreeAndNil(FBufferList);
+
+  for i := OldBufferList.Count-1 downto 0 do
+    TObject(OldBufferList[i]).Free;
+  FreeAndNil(OldBufferList);
+
+  FreeAndNil(FCriSecForBuffers);
   FreeAndNil(FTagList);
   FreeAndNil(FSubLexerBlocks);
   FreeAndNil(FStateChanges);
@@ -2695,6 +2715,7 @@ var
 var
   N, NNextPos: integer;
 begin
+  Assert(Assigned(FBuffer), 'Parser Buffer is nil');
   Source := FBuffer.FText;
   GetOwner;
   TryOpenSubLexer;
@@ -2833,12 +2854,60 @@ begin
    Result := 0;
 end;
 
+procedure TecParserResults.AddBuffer(ABuffer: TATStringBuffer);
+//AddBuffer and GetBuffer are called at the same time, in 2 threads
+begin
+  FCriSecForBuffers.Enter;
+  try
+    FBufferList.Add(ABuffer);
+  finally
+    FCriSecForBuffers.Leave;
+  end;
+end;
+
+function TecParserResults.GetBuffer: TATStringBuffer;
+//AddBuffer and GetBuffer are called at the same time, in 2 threads
+var
+  NCount, i: integer;
+begin
+  FCriSecForBuffers.Enter;
+  try
+    NCount := FBufferList.Count;
+    if NCount = 0 then
+      Exit(FBuffer);
+    if Assigned(FBuffer) then
+    begin
+      OldBufferList.Add(FBuffer);
+      FBuffer := nil;
+    end;
+    FBuffer := TATStringBuffer(FBufferList[NCount-1]);
+    for i := 0 to NCount-2 do
+      OldBufferList.Add(FBufferList[i]);
+    FBufferList.Clear;
+  finally
+    FCriSecForBuffers.Leave;
+  end;
+end;
+
+procedure TecParserResults.ClearOldBuffers;
+var
+  i: integer;
+begin
+  FCriSecForBuffers.Enter;
+  try
+    for i := OldBufferList.Count-1 downto 0 do
+      TObject(OldBufferList[i]).Free;
+    OldBufferList.Clear;
+  finally
+    FCriSecForBuffers.Leave;
+  end;
+end;
+
 { TecClientSyntAnalyzer }
 
-constructor TecClientSyntAnalyzer.Create(AOwner: TecSyntAnalyzer;
-  ABuffer: TATStringBuffer);
+constructor TecClientSyntAnalyzer.Create(AOwner: TecSyntAnalyzer);
 begin
-  inherited Create(AOwner, ABuffer, nil);
+  inherited Create(AOwner, nil);
 
   FRanges := TSortedList.Create(True);
   FOpenedBlocks := TSortedList.Create(False);
